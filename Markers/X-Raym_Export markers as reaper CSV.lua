@@ -22,13 +22,31 @@ time_offset = 0 -- 0, 3600 if timeline starts at 01:00:00
 ----------------------------------- END OF USER CONFIG AREA
 
 
-function GetSecondsFromFrame( pos, fps )
-	local seconds = pos/fps
-	return seconds
+function OutputToConsoleAndFile(output, file)
+    -- Print to the console
+    print(output)
+
+    -- Write to the file
+    file:write(output .. "\n")
 end
 
+function GetSecondsFromFrame( pos, fps )
+    local seconds = pos/fps
+    return seconds
+end
+
+-- Open the file for writing
+-- Change the path to your desired location (Also at the end of the script)
+local file = io.open("/Your/Path/reaper_markers.csv", "w")
+
+-- Check if the file opened successfully
+if not file then
+    print("Error: Could not open the file for writing.")
+    return
+end
 
 print("-------------------------")
+file:write("-------------------------\n")
 
 resolve = Resolve()
 pm = resolve:GetProjectManager()
@@ -38,23 +56,31 @@ markers = tl:GetMarkers()
 
 positions = {}
 for k, marker in pairs( markers ) do
-	table.insert(positions, k)
+    table.insert(positions, k)
 end
 
 table.sort( positions )
 
 fps = proj:GetSetting("timelineFrameRate")
 
-print("Type\tName\tPos_Start\tPos_End")
+local header = "Type\tName\tPos_Start\tPos_End"
+OutputToConsoleAndFile(header, file)
 
 for i, pos in ipairs(positions) do
-	local marker = markers[pos]
-	position = GetSecondsFromFrame( pos, fps ) + time_offset
-	local t = {
-		"M" .. i,
-		marker.name,
-		position,
-		position
-	}
-	print( table.concat( t, "\t" ) )
+    local marker = markers[pos]
+    local position = GetSecondsFromFrame( pos, fps ) + time_offset
+    local t = {
+        "M" .. i,
+        marker.name,
+        position,
+        position
+    }
+    
+    local output = table.concat( t, "\t")
+    OutputToConsoleAndFile(output, file)
 end
+
+-- Close the file
+file:close()
+
+print("Output written to /Your/Path/reaper_markers.csv")
