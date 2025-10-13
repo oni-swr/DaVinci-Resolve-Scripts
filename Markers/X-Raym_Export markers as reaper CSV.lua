@@ -7,11 +7,13 @@
  * Repository URI: https://github.com/X-Raym/DaVinci-Resolve-Scripts
  * Licence: GPL v3
  * REAPER: 5.0
- * Version: 1.0
+ * Version: 1.0.1
 --]]
 
 --[[
  * Changelog:
+ * v1.0.1 (2025-10-13)
+  * Export to file
  * v1.0 (2021-01-06)
   + Initial Release
 --]]
@@ -19,39 +21,27 @@
 
 -- USER CONFIG AREA ---------------------------------------
 time_offset = 0 -- 0, 3600 if timeline starts at 01:00:00
+
+file_path = "" -- absolute file path for export
 ----------------------------------- END OF USER CONFIG AREA
 
-
-function OutputToConsoleAndFile(output, file)
-    -- Print to the console
-    print(output)
-
-    -- Write to the file
-    file:write(output .. "\n")
-end
-
 function GetSecondsFromFrame( pos, fps )
-    local seconds = pos/fps
-    return seconds
+    return pos/fps
 end
 
--- Open the file for writing
--- Change the path to your desired location (Also at the end of the script)
-local file = io.open("/Your/Path/reaper_markers.csv", "w")
-
--- Check if the file opened successfully
-if not file then
-    print("Error: Could not open the file for writing.")
-    return
+function Export( str )
+  print( str )
+  if file then
+    file:write( str .. "\n" )
+  end
 end
 
-print("-------------------------")
-file:write("-------------------------\n")
-
+-- INIT
 resolve = Resolve()
 pm = resolve:GetProjectManager()
 proj = pm:GetCurrentProject()
 tl = proj:GetCurrentTimeline()
+fps = proj:GetSetting("timelineFrameRate")
 markers = tl:GetMarkers()
 
 positions = {}
@@ -61,11 +51,13 @@ end
 
 table.sort( positions )
 
-fps = proj:GetSetting("timelineFrameRate")
+-- Start export
+file = io.open( file_path, "w")
 
-local header = "Type\tName\tPos_Start\tPos_End"
-OutputToConsoleAndFile(header, file)
+Export( "Type\tName\tPos_Start\tPos_End" ) -- header
+Export( "-------------------------" )
 
+-- body
 for i, pos in ipairs(positions) do
     local marker = markers[pos]
     local position = GetSecondsFromFrame( pos, fps ) + time_offset
@@ -75,12 +67,10 @@ for i, pos in ipairs(positions) do
         position,
         position
     }
-    
-    local output = table.concat( t, "\t")
-    OutputToConsoleAndFile(output, file)
+
+    Export( table.concat( t, "\t") ) -- line
 end
 
--- Close the file
 file:close()
 
-print("Output written to /Your/Path/reaper_markers.csv")
+Export( (file and "\nExported File:\n"  .. path) or "No file exported.\:Edit file paht in the script header if needed." )
