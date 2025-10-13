@@ -73,4 +73,4 @@ end
 
 file:close()
 
-Export( (file and "\nExported File:\n"  .. path) or "No file exported.\:Edit file paht in the script header if needed." )
+Export( (file and "\nExported File:\n"  .. path) or "No file exported.\n:Edit file paht in the script header if needed." )
