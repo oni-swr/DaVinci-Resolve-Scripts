@@ -7,11 +7,15 @@
  * Repository URI: https://github.com/X-Raym/DaVinci-Resolve-Scripts
  * Licence: GPL v3
  * REAPER: 5.0
- * Version: 1.0
+ * Version: 1.1
 --]]
 
 --[[
  * Changelog:
+ * v1.1 (2026-09-18)
+  + Fix save file dialog: correctly resolve Fusion application object via resolve:Fusion()
+  + Fix file saving in sandboxed Lua environments via dual io.open / os.execute fallback
+  + Automatically copy CSV output to system clipboard via bmd.setclipboard
  * v1.0 (2026-09-18)
   + Initial Release
 --]]
@@ -22,7 +26,7 @@
 export_mode = "combined"
 
 -- Output file path for "combined" mode.
--- Leave empty "" to open a save file dialog (or auto-save to Desktop if dialog is not available)
+-- Leave empty "" to open a save file dialog (or auto-save to Desktop if dialog is cancelled/unavailable)
 file_path = ""
 
 -- CSV Delimiter: "," or ";" or "\t"
@@ -93,45 +97,13 @@ end
 local function GetDesktopPath()
   local home = os.getenv("USERPROFILE")
   if home and home ~= "" then
-    return home .. "\\Desktop\\"
+    return home:gsub("\\", "/") .. "/Desktop/"
   end
   home = os.getenv("HOME")
   if home and home ~= "" then
     return home .. "/Desktop/"
   end
   return ""
-end
-
-local function RequestSaveFilePath( default_filename )
-  local default_path = GetDesktopPath() .. default_filename
-
-  -- Check if Fusion / fu UI is available
-  local fusion_app = (type(fu) == "userdata" and fu) or (type(fusion) == "userdata" and fusion)
-  if not fusion_app and type(bmd) == "table" and bmd.scriptapp then
-    pcall(function() fusion_app = bmd.scriptapp("Fusion") end)
-  end
-
-  if fusion_app and fusion_app.RequestFile then
-    local ok, chosen = pcall(function()
-      return fusion_app:RequestFile(GetDesktopPath(), default_filename, {
-        FReqB_Saving = true,
-        FReqS_Title = "Export Clip Markers to CSV",
-        FReqS_Filter = "CSV Files (*.csv)|*.csv|All Files (*.*)|*.*"
-      })
-    end)
-    if ok and chosen and chosen ~= "" then
-      if not chosen:lower():match("%.csv$") then
-        chosen = chosen .. ".csv"
-      end
-      return chosen
-    elseif ok and chosen == nil then
-      -- User explicitly cancelled the save dialog
-      return nil
-    end
-  end
-
-  -- Fallback to Desktop path if dialog was closed or unavailable
-  return default_path
 end
 
 local function GetResolveApp()
@@ -168,6 +140,138 @@ local function GetResolveApp()
   return nil
 end
 
+local function GetFusionApp( resolve_instance )
+  -- Check global 'fusion'
+  if fusion and fusion.RequestFile then
+    return fusion
+  end
+
+  -- Check global 'fu'
+  if fu and fu.RequestFile then
+    return fu
+  end
+
+  -- Retrieve Fusion from Resolve application instance
+  local res = resolve_instance or GetResolveApp()
+  if res and res.Fusion then
+    local ok, f = pcall(function() return res:Fusion() end)
+    if ok and f and f.RequestFile then
+      return f
+    end
+  end
+
+  -- Check app:GetResolve():Fusion()
+  if app and app.GetResolve then
+    local ok, f = pcall(function() return app:GetResolve():Fusion() end)
+    if ok and f and f.RequestFile then
+      return f
+    end
+  end
+
+  -- Check bmd.scriptapp("Fusion")
+  if type(bmd) == "table" and bmd.scriptapp then
+    local ok, f = pcall(function() return bmd.scriptapp("Fusion") end)
+    if ok and f and f.RequestFile then
+      return f
+    end
+  end
+
+  return nil
+end
+
+local function RequestSaveFilePath( default_filename, resolve_instance )
+  local default_path = GetDesktopPath() .. default_filename
+  local fusion_app = GetFusionApp(resolve_instance)
+
+  if fusion_app and fusion_app.RequestFile then
+    local desktop_dir = GetDesktopPath()
+
+    -- Try 1: Open native Save dialog specifying desktop directory and default filename
+    local ok, chosen = pcall(function()
+      return fusion_app:RequestFile(desktop_dir, default_filename, {
+        FReqB_Saving = true,
+        FReqS_Title = "Export Clip Markers to CSV",
+        FReqS_Filter = "CSV Files (*.csv)|*.csv|All Files (*.*)|*.*",
+        FReqS_DefExt = "csv"
+      })
+    end)
+
+    -- Try 2: If desktop_dir caused an issue, open with empty initial path
+    if not ok or chosen == false then
+      ok, chosen = pcall(function()
+        return fusion_app:RequestFile("", default_filename, {
+          FReqB_Saving = true,
+          FReqS_Title = "Export Clip Markers to CSV",
+          FReqS_Filter = "CSV Files (*.csv)|*.csv|All Files (*.*)|*.*",
+          FReqS_DefExt = "csv"
+        })
+      end)
+    end
+
+    if ok and chosen and chosen ~= "" then
+      local path_str = tostring(chosen)
+      if not path_str:lower():match("%.csv$") then
+        path_str = path_str .. ".csv"
+      end
+      return path_str
+    elseif ok and chosen == nil then
+      -- User explicitly clicked Cancel in the file dialog
+      return nil
+    end
+  end
+
+  -- Fallback to Desktop path if dialog is unavailable
+  return default_path
+end
+
+-- Robust file writer that works with standard io or via os.execute Base64 PowerShell
+local function WriteTextFile( filepath, content )
+  -- 1. Try standard Lua io library (if not sandboxed)
+  local io_lib = io or (_G and _G.io)
+  if not io_lib and package and package.loaded then
+    io_lib = package.loaded.io
+  end
+  if not io_lib and pcall(require, "io") then
+    io_lib = require("io")
+  end
+
+  if io_lib and io_lib.open then
+    local f, err = io_lib.open(filepath, "w")
+    if f then
+      f:write(content)
+      f:close()
+      return true, "io.open"
+    end
+  end
+
+  -- 2. Windows fallback: Write via PowerShell Base64 (100% binary/character safe)
+  if os and os.execute then
+    local b64_chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+    local function to_b64(data)
+      return ((data:gsub('.', function(x)
+        local r,b='',x:byte()
+        for i=8,1,-1 do r=r..(b%2^i-b%2^(i-1)>0 and '1' or '0') end
+        return r
+      end)..'0000'):gsub('%d%d%d?%d?%d?', function(x)
+        if (#x < 6) then return '' end
+        local c=0
+        for i=1,6 do c=c+(x:sub(i,i)=='1' and 2^(6-i) or 0) end
+        return b64_chars:sub(c+1,c+1)
+      end)..({ '', '==', '=' })[#data%3+1])
+    end
+
+    local b64 = to_b64(content)
+    local safe_path = filepath:gsub('"', '""')
+    local ps_cmd = string.format('powershell -NoProfile -NonInteractive -Command "[System.IO.File]::WriteAllBytes(\'%s\', [System.Convert]::FromBase64String(\'%s\'))"', safe_path, b64)
+    local ret = os.execute(ps_cmd)
+    if ret == 0 or ret == true then
+      return true, "powershell"
+    end
+  end
+
+  return false, "Could not access file write API"
+end
+
 -- MAIN EXPORT LOGIC --------------------------------------
 
 function ExportMarkers()
@@ -185,7 +289,6 @@ function ExportMarkers()
     print("  fu: " .. tostring(fu))
     print("  fusion: " .. tostring(fusion))
     print("  bmd: " .. tostring(bmd))
-    print("Hint: If running from external terminal, ensure Resolve Studio is open with external scripting enabled.")
     print("Hint: In Resolve, place scripts in 'Utility' to run from any page, or 'Comp' to run from Fusion.")
     return
   end
@@ -418,7 +521,7 @@ function ExportMarkers()
     return
   end
 
-  -- ALWAYS PRINT CSV TO CONSOLE FIRST
+  -- PREPARE HEADERS AND CONTENT
   local headers = {
     "Clip Name",
     "Source File",
@@ -439,7 +542,9 @@ function ExportMarkers()
     "Custom Data"
   }
   local header_line = table.concat(headers, csv_delimiter)
+  local full_csv_content = (include_headers and (header_line .. "\n") or "") .. table.concat(combined_rows, "\n") .. "\n"
 
+  -- ALWAYS PRINT CSV TO CONSOLE
   print("\n==================== CSV OUTPUT ====================")
   if include_headers then
     print(header_line)
@@ -449,33 +554,34 @@ function ExportMarkers()
   end
   print("================== END CSV OUTPUT ==================\n")
 
-  -- ATTEMPT DIRECT FILE WRITE
+  -- COPY TO CLIPBOARD IF SUPPORTED
+  if bmd and bmd.setclipboard then
+    pcall(function() bmd.setclipboard(full_csv_content) end)
+    print("-> Note: CSV data has also been copied to your clipboard!")
+  end
+
+  -- SAVE TO FILE
   if export_mode == "combined" then
-    local safe_proj = proj_name:gsub('[\\/:*?"<>|]', "_")
-    local default_name = safe_proj .. "_Clip_Markers.csv"
-    local target_path = (file_path ~= "") and file_path or (GetDesktopPath() .. default_name)
+    local target_path = file_path
 
-    local has_io = (type(io) == "table" and type(io.open) == "function")
+    if not target_path or target_path == "" then
+      local safe_proj = proj_name:gsub('[\\/:*?"<>|]', "_")
+      local default_name = safe_proj .. "_Clip_Markers.csv"
+      target_path = RequestSaveFilePath(default_name, resolve)
+    end
 
-    if has_io then
-      local f, err = io.open(target_path, "w")
-      if f then
-        if include_headers then
-          f:write(header_line .. "\n")
-        end
-        for _, line in ipairs(combined_rows) do
-          f:write(line .. "\n")
-        end
-        f:close()
-        print("SUCCESS: Also saved CSV file to: " .. target_path)
-      else
-        print("Could not write file to " .. target_path .. " (" .. tostring(err) .. ")")
-      end
+    if not target_path or target_path == "" then
+      print("Export cancelled by user (or no path specified).")
+      return
+    end
+
+    local success, method = WriteTextFile(target_path, full_csv_content)
+    if success then
+      print("SUCCESS: Exported " .. total_markers_count .. " marker(s) to:")
+      print("  " .. target_path)
     else
-      print("[INFO] DaVinci Resolve's Lua sandbox disabled 'io', so the file could not be written directly from Lua.")
-      print("-> To save directly to a .csv file on your Desktop, run:")
-      print("   Workspace > Scripts > Utility > 'X-Raym_Export clip markers to CSV.py'")
-      print("-> Or copy the CSV lines printed above directly into Excel or a text editor.")
+      print("Warning: Could not directly write file: " .. tostring(method))
+      print("CSV output is printed above and copied to clipboard.")
     end
 
   elseif export_mode == "individual" then
@@ -484,16 +590,15 @@ function ExportMarkers()
       local path, name, ext = SplitFileName(clip_media_path)
       if path ~= "" and name ~= "" then
         local target_path = path .. name .. ".csv"
-        local f = io.open(target_path, "w")
-        if f then
-          if include_headers then
-            local headers = { "Timecode", "Color", "Name", "Note", "Duration", "CustomData" }
-            f:write(table.concat(headers, csv_delimiter) .. "\n")
-          end
-          for _, line in ipairs(rows) do
-            f:write(line .. "\n")
-          end
-          f:close()
+        local indiv_content = ""
+        if include_headers then
+          local headers = { "Timecode", "Color", "Name", "Note", "Duration", "CustomData" }
+          indiv_content = table.concat(headers, csv_delimiter) .. "\n"
+        end
+        indiv_content = indiv_content .. table.concat(rows, "\n") .. "\n"
+
+        local success, method = WriteTextFile(target_path, indiv_content)
+        if success then
           count_exported_files = count_exported_files + 1
           print("Exported: " .. target_path .. " (" .. #rows .. " markers)")
         else
