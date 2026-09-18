@@ -224,52 +224,20 @@ local function RequestSaveFilePath( default_filename, resolve_instance )
   return default_path
 end
 
--- Robust file writer that works with standard io or via os.execute Base64 PowerShell
+-- Standard file writer function to mimic other scripts
 local function WriteTextFile( filepath, content )
-  -- 1. Try standard Lua io library (if not sandboxed)
-  local io_lib = io or (_G and _G.io)
-  if not io_lib and package and package.loaded then
-    io_lib = package.loaded.io
+  if not io then
+    return false, "Global 'io' library is unavailable (sandboxed)."
   end
-  if not io_lib and pcall(require, "io") then
-    io_lib = require("io")
+  
+  local f, err = io.open(filepath, "w")
+  if f then
+    f:write(content)
+    f:close()
+    return true, "Success"
   end
-
-  if io_lib and io_lib.open then
-    local f, err = io_lib.open(filepath, "w")
-    if f then
-      f:write(content)
-      f:close()
-      return true, "io.open"
-    end
-  end
-
-  -- 2. Windows fallback: Write via PowerShell Base64 (100% binary/character safe)
-  if os and os.execute then
-    local b64_chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
-    local function to_b64(data)
-      return ((data:gsub('.', function(x)
-        local r,b='',x:byte()
-        for i=8,1,-1 do r=r..(b%2^i-b%2^(i-1)>0 and '1' or '0') end
-        return r
-      end)..'0000'):gsub('%d%d%d?%d?%d?', function(x)
-        if (#x < 6) then return '' end
-        local c=0
-        for i=1,6 do c=c+(x:sub(i,i)=='1' and 2^(6-i) or 0) end
-        return b64_chars:sub(c+1,c+1)
-      end)..({ '', '==', '=' })[#data%3+1])
-    end
-
-    local b64 = to_b64(content)
-    local safe_path = filepath:gsub('"', '""')
-    local ps_cmd = string.format('powershell -NoProfile -NonInteractive -Command "[System.IO.File]::WriteAllBytes(\'%s\', [System.Convert]::FromBase64String(\'%s\'))"', safe_path, b64)
-    local ret = os.execute(ps_cmd)
-    if ret == 0 or ret == true then
-      return true, "powershell"
-    end
-  end
-
-  return false, "Could not access file write API"
+  
+  return false, tostring(err)
 end
 
 -- MAIN EXPORT LOGIC --------------------------------------
@@ -575,12 +543,13 @@ function ExportMarkers()
       return
     end
 
-    local success, method = WriteTextFile(target_path, full_csv_content)
+    local success, method_or_err = WriteTextFile(target_path, full_csv_content)
     if success then
       print("SUCCESS: Exported " .. total_markers_count .. " marker(s) to:")
       print("  " .. target_path)
     else
-      print("Warning: Could not directly write file: " .. tostring(method))
+      print("Error: Could not save file to " .. target_path)
+      print("System message: " .. tostring(method_or_err))
       print("CSV output is printed above and copied to clipboard.")
     end
 
@@ -597,12 +566,12 @@ function ExportMarkers()
         end
         indiv_content = indiv_content .. table.concat(rows, "\n") .. "\n"
 
-        local success, method = WriteTextFile(target_path, indiv_content)
+        local success, method_or_err = WriteTextFile(target_path, indiv_content)
         if success then
           count_exported_files = count_exported_files + 1
           print("Exported: " .. target_path .. " (" .. #rows .. " markers)")
         else
-          print("Could not write: " .. target_path)
+          print("Error writing " .. target_path .. ": " .. tostring(method_or_err))
         end
       end
     end
