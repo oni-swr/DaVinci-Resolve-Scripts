@@ -91,37 +91,81 @@ local function SplitFileName( strfilename )
 end
 
 local function GetDesktopPath()
-  local home = os.getenv("USERPROFILE") or os.getenv("HOME") or ""
-  local sep = package.config:sub(1,1)
-  if home ~= "" then
-    return home .. sep .. "Desktop" .. sep
+  local home = os.getenv("USERPROFILE")
+  if home and home ~= "" then
+    return home .. "\\Desktop\\"
+  end
+  home = os.getenv("HOME")
+  if home and home ~= "" then
+    return home .. "/Desktop/"
   end
   return ""
 end
 
 local function RequestSaveFilePath( default_filename )
+  local default_path = GetDesktopPath() .. default_filename
+
   -- Check if Fusion / fu UI is available
   local fusion_app = (type(fu) == "userdata" and fu) or (type(fusion) == "userdata" and fusion)
   if not fusion_app and type(bmd) == "table" and bmd.scriptapp then
-    fusion_app = bmd.scriptapp("Fusion")
+    pcall(function() fusion_app = bmd.scriptapp("Fusion") end)
   end
 
   if fusion_app and fusion_app.RequestFile then
-    local chosen = fusion_app:RequestFile(GetDesktopPath(), default_filename, {
-      FReqB_Saving = true,
-      FReqS_Title = "Export Clip Markers to CSV",
-      FReqS_Filter = "CSV Files (*.csv)|*.csv|All Files (*.*)|*.*"
-    })
-    if chosen and chosen ~= "" then
+    local ok, chosen = pcall(function()
+      return fusion_app:RequestFile(GetDesktopPath(), default_filename, {
+        FReqB_Saving = true,
+        FReqS_Title = "Export Clip Markers to CSV",
+        FReqS_Filter = "CSV Files (*.csv)|*.csv|All Files (*.*)|*.*"
+      })
+    end)
+    if ok and chosen and chosen ~= "" then
       if not chosen:lower():match("%.csv$") then
         chosen = chosen .. ".csv"
       end
       return chosen
+    elseif ok and chosen == nil then
+      -- User explicitly cancelled the save dialog
+      return nil
     end
   end
 
   -- Fallback to Desktop path if dialog was closed or unavailable
-  return GetDesktopPath() .. default_filename
+  return default_path
+end
+
+local function GetResolveApp()
+  -- 1. Check if global 'resolve' is already valid (Utility / Edit page scripts)
+  if type(resolve) == "userdata" or (type(resolve) == "table" and resolve.GetProjectManager) then
+    return resolve
+  end
+
+  -- 2. Check if global 'Resolve' is a function (Console / some script contexts)
+  if type(Resolve) == "function" then
+    local res = Resolve()
+    if res then return res end
+  end
+
+  -- 3. Check if app:GetResolve() is available (Fusion page / Comp scripts)
+  if (type(app) == "userdata" or type(app) == "table") and app.GetResolve then
+    local res = app:GetResolve()
+    if res then return res end
+  end
+
+  -- 4. Check if fusion/fu:GetResolve() is available
+  local fusion_obj = (type(fu) == "userdata" and fu) or (type(fusion) == "userdata" and fusion)
+  if fusion_obj and fusion_obj.GetResolve then
+    local res = fusion_obj:GetResolve()
+    if res then return res end
+  end
+
+  -- 5. Check if bmd.scriptapp('Resolve') is available
+  if type(bmd) == "table" and bmd.scriptapp then
+    local res = bmd.scriptapp("Resolve")
+    if res then return res end
+  end
+
+  return nil
 end
 
 -- MAIN EXPORT LOGIC --------------------------------------
@@ -131,9 +175,18 @@ function ExportMarkers()
   print("  Export Clip Markers to CSV - X-Raym  ")
   print("========================================")
 
-  local resolve = Resolve and Resolve()
+  local resolve = GetResolveApp()
   if not resolve then
     print("Error: DaVinci Resolve scripting environment not found.")
+    print("Debug info:")
+    print("  resolve: " .. tostring(resolve))
+    print("  Resolve: " .. tostring(Resolve))
+    print("  app: " .. tostring(app))
+    print("  fu: " .. tostring(fu))
+    print("  fusion: " .. tostring(fusion))
+    print("  bmd: " .. tostring(bmd))
+    print("Hint: If running from external terminal, ensure Resolve Studio is open with external scripting enabled.")
+    print("Hint: In Resolve, place scripts in 'Utility' to run from any page, or 'Comp' to run from Fusion.")
     return
   end
 
@@ -365,62 +418,64 @@ function ExportMarkers()
     return
   end
 
-  -- WRITE EXPORT
+  -- ALWAYS PRINT CSV TO CONSOLE FIRST
+  local headers = {
+    "Clip Name",
+    "Source File",
+    "Track",
+    "Marker Source",
+    "Marker Name",
+    "Color",
+    "Source TC In",
+    "Source TC Out",
+    "Relative TC In",
+    "Relative TC Out",
+    "Timeline TC In",
+    "Timeline TC Out",
+    "Frame Offset",
+    "Duration Frames",
+    "Duration TC",
+    "Note",
+    "Custom Data"
+  }
+  local header_line = table.concat(headers, csv_delimiter)
+
+  print("\n==================== CSV OUTPUT ====================")
+  if include_headers then
+    print(header_line)
+  end
+  for _, line in ipairs(combined_rows) do
+    print(line)
+  end
+  print("================== END CSV OUTPUT ==================\n")
+
+  -- ATTEMPT DIRECT FILE WRITE
   if export_mode == "combined" then
-    local target_path = file_path
-    if not target_path or target_path == "" then
-      local safe_proj = proj_name:gsub('[\\/:*?"<>|]', "_")
-      local default_name = safe_proj .. "_Clip_Markers.csv"
-      target_path = RequestSaveFilePath(default_name)
-    end
+    local safe_proj = proj_name:gsub('[\\/:*?"<>|]', "_")
+    local default_name = safe_proj .. "_Clip_Markers.csv"
+    local target_path = (file_path ~= "") and file_path or (GetDesktopPath() .. default_name)
 
-    if not target_path or target_path == "" then
-      print("Export cancelled: no output path specified.")
-      return
-    end
+    local has_io = (type(io) == "table" and type(io.open) == "function")
 
-    local f, err = io.open(target_path, "w")
-    if not f then
-      print("Error: Could not open file for writing: " .. tostring(err))
-      print("Falling back to Desktop...")
-      target_path = GetDesktopPath() .. "Clip_Markers_Export.csv"
-      f, err = io.open(target_path, "w")
-    end
-
-    if f then
-      if include_headers then
-        local headers = {
-          "Clip Name",
-          "Source File",
-          "Track",
-          "Marker Source",
-          "Marker Name",
-          "Color",
-          "Source TC In",
-          "Source TC Out",
-          "Relative TC In",
-          "Relative TC Out",
-          "Timeline TC In",
-          "Timeline TC Out",
-          "Frame Offset",
-          "Duration Frames",
-          "Duration TC",
-          "Note",
-          "Custom Data"
-        }
-        f:write(table.concat(headers, csv_delimiter) .. "\n")
+    if has_io then
+      local f, err = io.open(target_path, "w")
+      if f then
+        if include_headers then
+          f:write(header_line .. "\n")
+        end
+        for _, line in ipairs(combined_rows) do
+          f:write(line .. "\n")
+        end
+        f:close()
+        print("SUCCESS: Also saved CSV file to: " .. target_path)
+      else
+        print("Could not write file to " .. target_path .. " (" .. tostring(err) .. ")")
       end
-
-      for _, line in ipairs(combined_rows) do
-        f:write(line .. "\n")
-      end
-      f:close()
-
-      print("SUCCESS!")
-      print("Exported " .. total_markers_count .. " marker(s) to:")
-      print(target_path)
     else
-      print("Failed to write to file: " .. tostring(err))
+      print("[INFO] DaVinci Resolve's Lua sandbox disabled 'io', so the file could not be written directly from Lua.")
+      print("-> To save directly to a .csv file on your Desktop, run:")
+      print("   Workspace > Scripts > Utility > 'X-Raym_Export clip markers to CSV.py'")
+      print("-> Or copy the CSV lines printed above directly into Excel or a text editor.")
     end
 
   elseif export_mode == "individual" then
