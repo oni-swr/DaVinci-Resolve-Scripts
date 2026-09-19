@@ -7,15 +7,11 @@
  * Repository URI: https://github.com/X-Raym/DaVinci-Resolve-Scripts
  * Licence: GPL v3
  * REAPER: 5.0
- * Version: 1.1
+ * Version: 1.0
 --]]
 
 --[[
  * Changelog:
- * v1.1 (2026-09-18)
-  + Fix save file dialog: correctly resolve Fusion application object via resolve:Fusion()
-  + Fix file saving in sandboxed Lua environments via dual io.open / os.execute fallback
-  + Automatically copy CSV output to system clipboard via bmd.setclipboard
  * v1.0 (2026-09-18)
   + Initial Release
 --]]
@@ -26,7 +22,7 @@
 export_mode = "combined"
 
 -- Output file path for "combined" mode.
--- Leave empty "" to open a save file dialog (or auto-save to Desktop if dialog is cancelled/unavailable)
+-- Leave empty "" to open a save file dialog (or auto-save to Desktop if dialog is not available)
 file_path = ""
 
 -- CSV Delimiter: "," or ";" or "\t"
@@ -97,13 +93,124 @@ end
 local function GetDesktopPath()
   local home = os.getenv("USERPROFILE")
   if home and home ~= "" then
-    return home:gsub("\\", "/") .. "/Desktop/"
+    return home .. "\\Desktop\\"
   end
   home = os.getenv("HOME")
   if home and home ~= "" then
     return home .. "/Desktop/"
   end
   return ""
+end
+
+local function Base64Encode(data)
+  local b = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+  return ((data:gsub('.', function(x) 
+    local r,b='',x:byte()
+    for i=8,1,-1 do r=r..(b%2^i-b%2^(i-1)>0 and '1' or '0') end
+    return r
+  end)..'0000'):gsub('%d%d%d?%d?%d?%d?', function(x)
+    if (#x < 6) then return '' end
+    local c=0
+    for i=1,6 do c=c+(x:sub(i,i)=='1' and 2^(6-i) or 0) end
+    return b:sub(c+1,c+1)
+  end)..({ '', '==', '=' })[#data%3+1])
+end
+
+local function WriteTextFile(filepath, content)
+  -- io.open: available when Resolve prefs set to "Allow all" scripted actions
+  if type(io) == "table" and type(io.open) == "function" then
+    local f, err = io.open(filepath, "w")
+    if f then
+      f:write(content)
+      f:close()
+      return true
+    end
+  end
+
+  return false, "No file I/O available in this sandbox"
+end
+
+local function ShowCSVDialog(csv_content, suggested_path)
+  -- Show CSV in a UIDispatcher dialog so the user can copy it manually.
+  -- bmd.UIDispatcher is available even when file I/O is sandboxed.
+  local fu_app = (type(fu) == "userdata" and fu) or (type(fusion) == "userdata" and fusion)
+  if not fu_app or type(bmd.UIDispatcher) ~= "function" then
+    -- Last resort: print to console
+    print("--- CSV DATA (COPY BELOW) ---")
+    print(csv_content)
+    print("--- END CSV DATA ---")
+    return
+  end
+
+  local ui  = fu_app.UIManager
+  local disp = bmd.UIDispatcher(ui)
+
+  local win = disp:AddWindow({
+    ID      = "CSVExportWin",
+    WindowTitle = "Export Clip Markers – Copy CSV",
+    Geometry = { 200, 200, 700, 500 },
+    ui:VGroup {
+      ui:Label {
+        ID = "InfoLabel",
+        Text = "File write is sandboxed. Select All (Ctrl+A) and Copy (Ctrl+C) the text below,\nthen paste into a text editor and save as a .csv file.\n\nSuggested path: " .. (suggested_path or ""),
+        WordWrap = true,
+      },
+      ui:TextEdit {
+        ID       = "CSVText",
+        Text     = csv_content,
+        ReadOnly = false,
+        Font     = ui:Font { Family = "Courier New", PixelSize = 11 },
+        Weight   = 1,
+      },
+      ui:HGroup {
+        Weight = 0,
+        ui:Button { ID = "CloseBtn", Text = "Close" },
+      },
+    },
+  })
+
+  function win.On.CloseBtn.Clicked(ev)
+    disp:ExitLoop()
+  end
+  function win.On.CSVExportWin.Close(ev)
+    disp:ExitLoop()
+  end
+
+  win:Show()
+  disp:RunLoop()
+  win:Hide()
+end
+
+local function RequestSaveFilePath( default_filename )
+  local default_path = GetDesktopPath() .. default_filename
+
+  -- Check if Fusion / fu UI is available
+  local fusion_app = (type(fu) == "userdata" and fu) or (type(fusion) == "userdata" and fusion)
+  if not fusion_app and type(bmd) == "table" and bmd.scriptapp then
+    pcall(function() fusion_app = bmd.scriptapp("Fusion") end)
+  end
+
+  if fusion_app and fusion_app.RequestFile then
+    local ok, chosen = pcall(function()
+      return fusion_app:RequestFile(GetDesktopPath(), default_filename, {
+        FReqB_Saving = true,
+        FReqS_Title = "Export Clip Markers to CSV",
+        FReqS_Filter = "CSV Files (*.csv)|*.csv|All Files (*.*)|*.*"
+      })
+    end)
+    if ok and chosen and chosen ~= "" then
+      if not chosen:lower():match("%.csv$") then
+        chosen = chosen .. ".csv"
+      end
+      return chosen
+    elseif ok and chosen == nil then
+      -- User explicitly cancelled the save dialog
+      return nil
+    end
+  end
+
+  -- Fallback to Desktop path if dialog was closed or unavailable
+  return default_path
 end
 
 local function GetResolveApp()
@@ -140,106 +247,6 @@ local function GetResolveApp()
   return nil
 end
 
-local function GetFusionApp( resolve_instance )
-  -- Check global 'fusion'
-  if fusion and fusion.RequestFile then
-    return fusion
-  end
-
-  -- Check global 'fu'
-  if fu and fu.RequestFile then
-    return fu
-  end
-
-  -- Retrieve Fusion from Resolve application instance
-  local res = resolve_instance or GetResolveApp()
-  if res and res.Fusion then
-    local ok, f = pcall(function() return res:Fusion() end)
-    if ok and f and f.RequestFile then
-      return f
-    end
-  end
-
-  -- Check app:GetResolve():Fusion()
-  if app and app.GetResolve then
-    local ok, f = pcall(function() return app:GetResolve():Fusion() end)
-    if ok and f and f.RequestFile then
-      return f
-    end
-  end
-
-  -- Check bmd.scriptapp("Fusion")
-  if type(bmd) == "table" and bmd.scriptapp then
-    local ok, f = pcall(function() return bmd.scriptapp("Fusion") end)
-    if ok and f and f.RequestFile then
-      return f
-    end
-  end
-
-  return nil
-end
-
-local function RequestSaveFilePath( default_filename, resolve_instance )
-  local default_path = GetDesktopPath() .. default_filename
-  local fusion_app = GetFusionApp(resolve_instance)
-
-  if fusion_app and fusion_app.RequestFile then
-    local desktop_dir = GetDesktopPath()
-
-    -- Try 1: Open native Save dialog specifying desktop directory and default filename
-    local ok, chosen = pcall(function()
-      return fusion_app:RequestFile(desktop_dir, default_filename, {
-        FReqB_Saving = true,
-        FReqS_Title = "Export Clip Markers to CSV",
-        FReqS_Filter = "CSV Files (*.csv)|*.csv|All Files (*.*)|*.*",
-        FReqS_DefExt = "csv"
-      })
-    end)
-
-    -- Try 2: If desktop_dir caused an issue, open with empty initial path
-    if not ok or chosen == false then
-      ok, chosen = pcall(function()
-        return fusion_app:RequestFile("", default_filename, {
-          FReqB_Saving = true,
-          FReqS_Title = "Export Clip Markers to CSV",
-          FReqS_Filter = "CSV Files (*.csv)|*.csv|All Files (*.*)|*.*",
-          FReqS_DefExt = "csv"
-        })
-      end)
-    end
-
-    if ok and chosen and chosen ~= "" then
-      local path_str = tostring(chosen)
-      if not path_str:lower():match("%.csv$") then
-        path_str = path_str .. ".csv"
-      end
-      return path_str
-    elseif ok and chosen == nil then
-      -- User explicitly clicked Cancel in the file dialog
-      return nil
-    end
-  end
-
-  -- Fallback to Desktop path if dialog is unavailable
-  return default_path
-end
-
--- Standard file writer function to mimic other scripts
-local function WriteTextFile( filepath, content )
-  if not io then
-    return false, "Global 'io' library is unavailable (sandboxed)."
-  end
-  
-  local f, err = io.open(filepath, "w")
-  if f then
-    f:write(content)
-    f:close()
-    return true, "Success"
-  end
-  
-  return false, tostring(err)
-end
-
 -- MAIN EXPORT LOGIC --------------------------------------
 
 function ExportMarkers()
@@ -257,6 +264,7 @@ function ExportMarkers()
     print("  fu: " .. tostring(fu))
     print("  fusion: " .. tostring(fusion))
     print("  bmd: " .. tostring(bmd))
+    print("Hint: If running from external terminal, ensure Resolve Studio is open with external scripting enabled.")
     print("Hint: In Resolve, place scripts in 'Utility' to run from any page, or 'Comp' to run from Fusion.")
     return
   end
@@ -489,96 +497,89 @@ function ExportMarkers()
     return
   end
 
-  -- PREPARE HEADERS AND CONTENT
-  local headers = {
-    "Clip Name",
-    "Source File",
-    "Track",
-    "Marker Source",
-    "Marker Name",
-    "Color",
-    "Source TC In",
-    "Source TC Out",
-    "Relative TC In",
-    "Relative TC Out",
-    "Timeline TC In",
-    "Timeline TC Out",
-    "Frame Offset",
-    "Duration Frames",
-    "Duration TC",
-    "Note",
-    "Custom Data"
-  }
-  local header_line = table.concat(headers, csv_delimiter)
-  local full_csv_content = (include_headers and (header_line .. "\n") or "") .. table.concat(combined_rows, "\n") .. "\n"
-
-  -- ALWAYS PRINT CSV TO CONSOLE
-  print("\n==================== CSV OUTPUT ====================")
-  if include_headers then
-    print(header_line)
-  end
-  for _, line in ipairs(combined_rows) do
-    print(line)
-  end
-  print("================== END CSV OUTPUT ==================\n")
-
-  -- COPY TO CLIPBOARD IF SUPPORTED
-  if bmd and bmd.setclipboard then
-    pcall(function() bmd.setclipboard(full_csv_content) end)
-    print("-> Note: CSV data has also been copied to your clipboard!")
-  end
-
-  -- SAVE TO FILE
+  -- WRITE EXPORT
   if export_mode == "combined" then
-    local target_path = file_path
+      local target_path = file_path
+      if not target_path or target_path == "" then
+        local safe_proj = proj_name:gsub('[\\/:*?"<>|]', "_")
+        local default_name = safe_proj .. "_Clip_Markers.csv"
+        target_path = RequestSaveFilePath(default_name)
+      end
 
-    if not target_path or target_path == "" then
-      local safe_proj = proj_name:gsub('[\\/:*?"<>|]', "_")
-      local default_name = safe_proj .. "_Clip_Markers.csv"
-      target_path = RequestSaveFilePath(default_name, resolve)
-    end
+      if not target_path or target_path == "" then
+        print("Export cancelled: no output path specified.")
+        return
+      end
 
-    if not target_path or target_path == "" then
-      print("Export cancelled by user (or no path specified).")
-      return
-    end
+      local csv_lines = {}
+      if include_headers then
+        local headers = {
+          "Clip Name",
+          "Source File",
+          "Track",
+          "Marker Source",
+          "Marker Name",
+          "Color",
+          "Source TC In",
+          "Source TC Out",
+          "Relative TC In",
+          "Relative TC Out",
+          "Timeline TC In",
+          "Timeline TC Out",
+          "Frame Offset",
+          "Duration Frames",
+          "Duration TC",
+          "Note",
+          "Custom Data"
+        }
+        table.insert(csv_lines, table.concat(headers, csv_delimiter))
+      end
 
-    local success, method_or_err = WriteTextFile(target_path, full_csv_content)
-    if success then
-      print("SUCCESS: Exported " .. total_markers_count .. " marker(s) to:")
-      print("  " .. target_path)
-    else
-      print("Error: Could not save file to " .. target_path)
-      print("System message: " .. tostring(method_or_err))
-      print("CSV output is printed above and copied to clipboard.")
-    end
+      for _, line in ipairs(combined_rows) do
+        table.insert(csv_lines, line)
+      end
 
-  elseif export_mode == "individual" then
-    local count_exported_files = 0
-    for clip_media_path, rows in pairs(individual_files) do
-      local path, name, ext = SplitFileName(clip_media_path)
-      if path ~= "" and name ~= "" then
-        local target_path = path .. name .. ".csv"
-        local indiv_content = ""
-        if include_headers then
-          local headers = { "Timecode", "Color", "Name", "Note", "Duration", "CustomData" }
-          indiv_content = table.concat(headers, csv_delimiter) .. "\n"
-        end
-        indiv_content = indiv_content .. table.concat(rows, "\n") .. "\n"
+      local full_csv_content = table.concat(csv_lines, "\n") .. "\n"
+      local success = WriteTextFile(target_path, full_csv_content)
 
-        local success, method_or_err = WriteTextFile(target_path, indiv_content)
-        if success then
-          count_exported_files = count_exported_files + 1
-          print("Exported: " .. target_path .. " (" .. #rows .. " markers)")
-        else
-          print("Error writing " .. target_path .. ": " .. tostring(method_or_err))
+      if success then
+        print("SUCCESS!")
+        print("Exported " .. total_markers_count .. " marker(s) to:")
+        print(target_path)
+      else
+        print("Notice: File write sandboxed. Fix: Preferences > System > General > 'Automatic scripted actions' > 'Allow all'")
+        print("\n--- CSV DATA ---")
+        print(full_csv_content)
+        print("--- END CSV DATA ---")
+      end
+
+    elseif export_mode == "individual" then
+      local count_exported_files = 0
+      for clip_media_path, rows in pairs(individual_files) do
+        local path, name, ext = SplitFileName(clip_media_path)
+        if path ~= "" and name ~= "" then
+          local target_path = path .. name .. ".csv"
+          local indiv_lines = {}
+          if include_headers then
+            local headers = { "Timecode", "Color", "Name", "Note", "Duration", "CustomData" }
+            table.insert(indiv_lines, table.concat(headers, csv_delimiter))
+          end
+          for _, line in ipairs(rows) do
+            table.insert(indiv_lines, line)
+          end
+          local indiv_content = table.concat(indiv_lines, "\n") .. "\n"
+          if WriteTextFile(target_path, indiv_content) then
+            count_exported_files = count_exported_files + 1
+            print("Exported: " .. target_path .. " (" .. #rows .. " markers)")
+          else
+            print("Could not write: " .. target_path)
+          end
         end
       end
+      print("SUCCESS: Exported individual CSV files for " .. count_exported_files .. " clip(s).")
     end
-    print("SUCCESS: Exported individual CSV files for " .. count_exported_files .. " clip(s).")
-  end
 
-  print("========================================")
+    print("========================================")
 end
 
 -- RUN
